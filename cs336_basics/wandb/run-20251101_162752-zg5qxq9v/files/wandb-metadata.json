@@ -1,0 +1,44 @@
+{
+  "os":  "macOS-15.6.1-arm64-arm-64bit-Mach-O",
+  "python":  "CPython 3.13.5",
+  "startedAt":  "2025-11-01T23:27:52.693773Z",
+  "program":  "/Users/chengze/work/336_assignmen1/cs336_basics/dev.ipynb",
+  "codePath":  "cs336_basics/dev.ipynb",
+  "git":  {
+    "remote":  "git@github.com:zx3xyy/336_assignmen1.git",
+    "commit":  "67a96f8f02c053a70e19551573f7db617918ac4d"
+  },
+  "email":  "fancz2002@gmail.com",
+  "root":  "/Users/chengze/work/336_assignmen1/cs336_basics",
+  "host":  "Chengzes-Macbook-Air.local",
+  "executable":  "/Users/chengze/work/336_assignmen1/.venv/bin/python",
+  "codePathLocal":  "dev.ipynb",
+  "cpu_count":  8,
+  "cpu_count_logical":  8,
+  "disk":  {
+    "/":  {
+      "total":  "494384795648",
+      "used":  "451439136768"
+    },
+    "/System/Volumes/Data":  {
+      "total":  "494384795648",
+      "used":  "451439136768"
+    }
+  },
+  "memory":  {
+    "total":  "17179869184"
+  },
+  "cpu":  {
+    "count":  8,
+    "countLogical":  8
+  },
+  "apple":  {
+    "name":  "Apple M2",
+    "ecpuCores":  4,
+    "pcpuCores":  4,
+    "gpuCores":  8,
+    "memoryGb":  16,
+    "swapTotalBytes":  "2147483648",
+    "ramTotalBytes":  "17179869184"
+  }
+}
