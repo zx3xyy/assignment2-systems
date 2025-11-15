@@ -1,0 +1,110 @@
+import torch
+import numpy as np
+import random
+from torch.amp import autocast 
+from cs336_basics.transformer import Transformer
+from cs336_basics.train import AdamW, get_batch, gradient_clipping, get_lr_schedule,CrossEntropyLossWithLogits, save_checkpoint
+import wandb  
+from cs336_basics.config import Config
+from pathlib import Path
+import tyro
+from rich.console import Console
+from rich.table import Table
+from dataclasses import asdict
+import time
+import traceback
+import sys
+from timeit import default_timer as timer
+
+console = Console()
+def print_config(cfg: Config) -> None:
+    table = Table(title="[bold cyan]Experiment Configuration[/bold cyan]", show_lines=False)
+    table.add_column("Field", style="bold yellow")
+    table.add_column("Value", style="bold white")
+    for k, v in asdict(cfg).items():
+        table.add_row(k, str(v))
+    console.print(table)
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
+    # os.environ['PYTHONHASHSEED'] = str(seed)
+    # torch.use_deterministic_algorithms(True)
+    # if torch.cuda.is_available():
+    #     torch.backends.cudnn.deterministic = True
+    #     torch.backends.cudnn.benchmark = False
+
+def validate_config(cfg: Config):
+    if cfg.device == "cuda"  and not torch.cuda.is_available():
+        console.print("[red]CUDA not avaiable! fallback to cpu[/red]")
+        cfg.device = "cpu"
+
+def benchmark_one_step(model, data, target, cfg, loss, optimizer):
+    logits = model(data)
+    if loss and optimizer:
+        loss(logits, target)
+        loss.backward()
+        gradient_clipping(model.parameters(), cfg.grad_clip_cap)
+        lr = get_lr_schedule(t, cfg.max_lr, cfg.min_lr, cfg.t_w, cfg.t_c)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+        optimizer.step()
+
+        
+def benchmark(model, data, target, cfg, loss, optimizer):
+    # Warmup
+    console.print("warming up...")
+    for _ in range(cfg.n_iter_warmup):
+        benchmark_one_step(model, data, target, cfg, loss, optimizer)
+    
+    torch.cuda.synchronize()  
+    console.print("starting benchmark...")  
+    start = timer()
+    for _ in range(cfg.n_iter_benchmark):
+        benchmark_one_step(model, data, target, cfg, loss, optimizer)
+        torch.cuda.synchronize()
+    end = timer()
+    
+    console.print(f"[green]✅ Benchmark Finished: {cfg.n_iter_benchmark / (end - start)} it/s [/green]")
+
+def main():
+    set_seed(42)
+    torch.set_float32_matmul_precision('high')
+
+    cfg: Config = tyro.cli(Config)
+    validate_config(cfg)
+    print_config(cfg)
+    data = np.load(cfg.train_data_path, mmap_mode="r")
+
+    console.print(f"[green]✅ Loaded train data shape:[/green] {data.shape}")
+
+    model = Transformer(
+            cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.context_length, cfg.rope_theta, cfg.vocab_size, cfg.num_layers
+        ).to(cfg.device)
+
+    
+    
+    seq, target = get_batch(x=data, batch_size=cfg.batch_size, context_length=cfg.context_length, device=cfg.device)
+
+    if cfg.benchmark:
+        loss_module = CrossEntropyLossWithLogits() if cfg.benchmark_backward else None
+        optimizer = AdamW(model.parameters()) if cfg.benchmark_backward else None
+        benchmark(model, seq, target, cfg, loss_module, optimizer)
+
+    
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        console.print("⚠️ Training crashed with exception:", repr(e))
+        console.print("------ Traceback ------")
+        traceback.print_exc()
+        console.print("-----------------------")
+        sys.exit(1)
