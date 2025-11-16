@@ -51,10 +51,6 @@ def benchmark_one_step(model, data, target, cfg, loss_module, optimizer):
     if loss_module and optimizer:
         loss = loss_module(logits, target)
         loss.backward()
-        gradient_clipping(model.parameters(), cfg.grad_clip_cap)
-        lr = get_lr_schedule(t, cfg.max_lr, cfg.min_lr, cfg.t_w, cfg.t_c)
-        for group in optimizer.param_groups:
-            group["lr"] = lr
         optimizer.step()
 
         
