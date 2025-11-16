@@ -81,18 +81,12 @@ def main():
     cfg: Config = tyro.cli(Config)
     validate_config(cfg)
     print_config(cfg)
-    data = np.load(cfg.train_data_path, mmap_mode="r")
-
-    console.print(f"[green]✅ Loaded train data shape:[/green] {data.shape}")
-
     model = Transformer(
             cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.context_length, cfg.rope_theta, cfg.vocab_size, cfg.num_layers
         ).to(cfg.device)
-
+    seq = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.context_length), device=cfg.device)
+    target = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.context_length), device=cfg.device)
     
-    
-    seq, target = get_batch(x=data, batch_size=cfg.batch_size, context_length=cfg.context_length, device=cfg.device)
-
     if cfg.benchmark:
         loss_module = CrossEntropyLossWithLogits() if cfg.benchmark_backward else None
         optimizer = AdamW(model.parameters()) if cfg.benchmark_backward else None
