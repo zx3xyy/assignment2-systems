@@ -46,10 +46,10 @@ def validate_config(cfg: Config):
         console.print("[red]CUDA not avaiable! fallback to cpu[/red]")
         cfg.device = "cpu"
 
-def benchmark_one_step(model, data, target, cfg, loss, optimizer):
+def benchmark_one_step(model, data, target, cfg, loss_module, optimizer):
     logits = model(data)
-    if loss and optimizer:
-        loss(logits, target)
+    if loss_module and optimizer:
+        loss = loss_module(logits, target)
         loss.backward()
         gradient_clipping(model.parameters(), cfg.grad_clip_cap)
         lr = get_lr_schedule(t, cfg.max_lr, cfg.min_lr, cfg.t_w, cfg.t_c)
