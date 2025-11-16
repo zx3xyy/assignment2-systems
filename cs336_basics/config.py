@@ -52,3 +52,11 @@ class Config:
     @property
     def max_iter(self) -> int:
         return math.ceil(self.target_token / self.context_length / self.batch_size)
+
+
+def process_config(cfg: Config):
+    preset = MODEL_PRESETS.get(cfg.model_name)
+    if preset is None:
+        return
+    for k, v in preset.items():
+        setattr(cfg, k, v)

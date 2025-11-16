@@ -36,16 +36,6 @@ def set_seed(seed: int):
     if torch.backends.mps.is_available():
         torch.mps.manual_seed(seed)
 
-def process_config(cfg: Config):
-    if cfg.device == "cuda"  and not torch.cuda.is_available():
-        console.print("[red]CUDA not avaiable! fallback to cpu[/red]")
-        cfg.device = "cpu"
-    preset = MODEL_PRESETS.get(cfg.model_name)
-    if preset is None:
-        return
-    for k, v in preset.items():
-        setattr(cfg, k, v)
-            
 def benchmark_one_step(model, data, target, cfg, loss_module, optimizer):
     logits = model(data)
     if loss_module and optimizer:
@@ -54,40 +44,42 @@ def benchmark_one_step(model, data, target, cfg, loss_module, optimizer):
         optimizer.step()
 
         
-def benchmark(model, data, target, cfg, loss, optimizer):
+def benchmark(cfg):  
+    print_config(cfg)
+    # Generate Model
+    model = Transformer(
+            cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.context_length, cfg.rope_theta, cfg.vocab_size, cfg.num_layers
+        ).to(cfg.device)
+    loss_module = CrossEntropyLossWithLogits() if cfg.benchmark_backward else None
+    optimizer = AdamW(model.parameters()) if cfg.benchmark_backward else None
+    
+    # Generate data
+    data = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.context_length), device=cfg.device)
+    target = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.context_length), device=cfg.device)
+    
     # Warmup
     console.print("warming up...")
     for _ in range(cfg.n_iter_warmup):
-        benchmark_one_step(model, data, target, cfg, loss, optimizer)
+        benchmark_one_step(model, data, target, cfg, loss_module, optimizer)
     
     torch.cuda.synchronize()  
     console.print("starting benchmark...")  
     start = timer()
     for _ in range(cfg.n_iter_benchmark):
-        benchmark_one_step(model, data, target, cfg, loss, optimizer)
+        benchmark_one_step(model, data, target, cfg, loss_module, optimizer)
         torch.cuda.synchronize()
     end = timer()
     
     console.print(f"[green]✅ Benchmark Finished: {cfg.n_iter_benchmark / (end - start)} it/s [/green]")
+    console.print(f"[green]✅ Benchmark Finished: {(end - start) / cfg.n_iter_benchmark} s/it [/green]")
 
 def main():
     set_seed(42)
     torch.set_float32_matmul_precision('high')
-
     cfg: Config = tyro.cli(Config)
     process_config(cfg)
-    print_config(cfg)
-    model = Transformer(
-            cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.context_length, cfg.rope_theta, cfg.vocab_size, cfg.num_layers
-        ).to(cfg.device)
-    seq = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.context_length), device=cfg.device)
-    target = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.context_length), device=cfg.device)
-    
     if cfg.benchmark:
-        loss_module = CrossEntropyLossWithLogits() if cfg.benchmark_backward else None
-        optimizer = AdamW(model.parameters()) if cfg.benchmark_backward else None
-        benchmark(model, seq, target, cfg, loss_module, optimizer)
-
+        benchmark(cfg)
     
 if __name__ == "__main__":
     try:
