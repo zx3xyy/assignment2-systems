@@ -5,7 +5,7 @@ from torch.amp import autocast
 from cs336_basics.transformer import Transformer
 from cs336_basics.train import AdamW, get_batch, gradient_clipping, get_lr_schedule,CrossEntropyLossWithLogits, save_checkpoint
 import wandb  
-from cs336_basics.config import Config
+from cs336_basics.config import Config, MODEL_PRESETS
 from pathlib import Path
 import tyro
 from rich.console import Console
@@ -35,17 +35,17 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
     if torch.backends.mps.is_available():
         torch.mps.manual_seed(seed)
-    # os.environ['PYTHONHASHSEED'] = str(seed)
-    # torch.use_deterministic_algorithms(True)
-    # if torch.cuda.is_available():
-    #     torch.backends.cudnn.deterministic = True
-    #     torch.backends.cudnn.benchmark = False
 
-def validate_config(cfg: Config):
+def process_config(cfg: Config):
     if cfg.device == "cuda"  and not torch.cuda.is_available():
         console.print("[red]CUDA not avaiable! fallback to cpu[/red]")
         cfg.device = "cpu"
-
+    preset = MODEL_PRESETS.get(cfg.model_name)
+    if preset is None:
+        return
+    for k, v in preset.items():
+        setattr(cfg, k, v)
+            
 def benchmark_one_step(model, data, target, cfg, loss_module, optimizer):
     logits = model(data)
     if loss_module and optimizer:
@@ -75,7 +75,7 @@ def main():
     torch.set_float32_matmul_precision('high')
 
     cfg: Config = tyro.cli(Config)
-    validate_config(cfg)
+    process_config(cfg)
     print_config(cfg)
     model = Transformer(
             cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.context_length, cfg.rope_theta, cfg.vocab_size, cfg.num_layers
