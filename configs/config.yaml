@@ -1,0 +1,10 @@
+defaults:
+  - model: small
+  - benchmark: forward_only
+  - _self_
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+experiment_name: "benchmark"

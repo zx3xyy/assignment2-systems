@@ -1,0 +1,7 @@
+vocab_size: 10000
+context_length: 128
+d_model: 768
+d_ff: 3072
+num_layers: 12
+num_heads: 12
+rope_theta: 10000.0

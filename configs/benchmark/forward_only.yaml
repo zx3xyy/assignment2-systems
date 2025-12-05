@@ -1,0 +1,6 @@
+warmup_iters: 5
+run_iters: 10
+verbose: true
+batch_size: 8
+device: cuda
+mode: forward_only
