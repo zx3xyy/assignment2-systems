@@ -1,0 +1,14 @@
+{
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/cs336-basics"
+    ],
+    "python.analysis.autoImportCompletions": true,
+    "python.analysis.completeFunctionParens": true,
+    "editor.formatOnSave": true,
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.black-formatter",
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit"
+        }
+    }
+}
