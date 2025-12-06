@@ -18,7 +18,11 @@ from hydra.core.config_store import ConfigStore
 
 from cs336_basics.data import get_batch
 from cs336_basics.model import BasicsTransformerLM
+import cs336_basics.model
 import torch.cuda.nvtx as nvtx
+from einops import einsum
+import math
+from cs336_basics.nn_utils import softmax
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +61,29 @@ class Config:
 
 cs = ConfigStore.instance()
 cs.store(name="config_schema", node=Config)
+
+
+@nvtx.range("scaled dot product attention")
+def annotated_scaled_dot_product_attention(Q, K, V, mask):
+    d_k = K.shape[-1]
+    with nvtx.range("computing attention scores"):
+        attention_scores = einsum(
+            Q, K, "... query d_k, ... key d_k -> ... query key"
+        ) / math.sqrt(d_k)
+        if mask is not None:
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
+    with nvtx.range("computing softmax"):
+        attention_weights = softmax(
+            attention_scores, dim=-1
+        )  # Softmax over the key dimension
+    with nvtx.range("final matmul"):
+        res = einsum(
+            attention_weights, V, "... query key, ... key d_v ->  ... query d_v"
+        )
+    return res
+
+
+cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 
 def get_git_info() -> dict[str, str]:
@@ -261,9 +288,11 @@ def benchmark_forward(
     # Warmup
     if cfg.benchmark.verbose:
         log.info(f"[Forward] Running {cfg.benchmark.warmup_iters} warmup iterations...")
-    for _ in range(cfg.benchmark.warmup_iters):
-        with torch.no_grad():
-            _ = model(x)
+    
+    with torch.cuda.nvtx.range("warmup"):
+        for _ in range(cfg.benchmark.warmup_iters):
+            with torch.no_grad():
+                _ = model(x)
     sync_device(device)
 
     # Reset memory stats
@@ -277,12 +306,15 @@ def benchmark_forward(
     sync_device(device)
     if "cuda" in device and cfg.benchmark.profile:
         torch.cuda.profiler.start()
-    start = time.perf_counter()
-    for _ in range(cfg.benchmark.run_iters):
-        with torch.no_grad():
-            _ = model(x)
-    sync_device(device)
-    end = time.perf_counter()
+    
+    with torch.cuda.nvtx.range("benchmark_loop"):
+        start = time.perf_counter()
+        for _ in range(cfg.benchmark.run_iters):
+            with torch.no_grad():
+                _ = model(x)
+        sync_device(device)
+        end = time.perf_counter()
+    
     if "cuda" in device and cfg.benchmark.profile:
         torch.cuda.profiler.stop()
 
@@ -310,12 +342,14 @@ def benchmark_forward_backward(
         log.info(
             f"[Forward+Backward] Running {cfg.benchmark.warmup_iters} warmup iterations..."
         )
-    for _ in range(cfg.benchmark.warmup_iters):
-        outputs = model(x)
-        loss = criterion(outputs.view(-1, cfg.model.vocab_size), y.view(-1))
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+    
+    with torch.cuda.nvtx.range("warmup"):
+        for _ in range(cfg.benchmark.warmup_iters):
+            outputs = model(x)
+            loss = criterion(outputs.view(-1, cfg.model.vocab_size), y.view(-1))
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
     sync_device(device)
 
     # Reset memory stats
@@ -331,15 +365,18 @@ def benchmark_forward_backward(
     sync_device(device)
     if "cuda" in device and cfg.benchmark.profile:
         torch.cuda.profiler.start()
-    start = time.perf_counter()
-    for _ in range(cfg.benchmark.run_iters):
-        outputs = model(x)
-        loss = criterion(outputs.view(-1, cfg.model.vocab_size), y.view(-1))
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-    sync_device(device)
-    end = time.perf_counter()
+    
+    with torch.cuda.nvtx.range("benchmark_loop"):
+        start = time.perf_counter()
+        for _ in range(cfg.benchmark.run_iters):
+            outputs = model(x)
+            loss = criterion(outputs.view(-1, cfg.model.vocab_size), y.view(-1))
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+        sync_device(device)
+        end = time.perf_counter()
+    
     if "cuda" in device and cfg.benchmark.profile:
         torch.cuda.profiler.stop()
 
@@ -362,16 +399,21 @@ def main(cfg: Config):
     log.info(f"Git: {git_info['hash_short']} ({git_info['branch']})")
     log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
 
-    if cfg.benchmark.device != "cuda" and torch.cuda.is_available():
-        log.warning("CUDA is available but device is set to CPU!")
+    if cfg.benchmark.device != "cuda":
+        raise ValueError("Device must be set to 'cuda' for this benchmark.")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available on this system.")
 
     try:
         # 2. Initialize Model & Data
-        model = init_model(cfg)
+        with torch.cuda.nvtx.range("init_model"):
+            model = init_model(cfg)
         model_params = model.get_num_params()
         log.info(f"Model parameters: {model_params / 1e6:.2f}M")
 
-        x, y = generate_random_data(cfg)
+        with torch.cuda.nvtx.range("generate_data"):
+            x, y = generate_random_data(cfg)
 
         # 3. Run Benchmark
         if cfg.benchmark.mode == "forward_only":
