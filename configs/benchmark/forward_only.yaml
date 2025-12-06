@@ -1,6 +1,10 @@
 warmup_iters: 5
 run_iters: 10
 verbose: true
-batch_size: 8
+batch_size: 4
 device: cuda
 mode: forward_only
+precision: fp32
+compile: false
+compile_mode: default
+profile: false

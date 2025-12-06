@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import time
+import gc
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,50 @@ import numpy as np
 import torch
 import wandb
 from omegaconf import DictConfig, OmegaConf
+from dataclasses import dataclass, field
+from hydra.core.config_store import ConfigStore
 
 from cs336_basics.data import get_batch
 from cs336_basics.model import BasicsTransformerLM
+import torch.cuda.nvtx as nvtx
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class ModelConfig:
+    vocab_size: int = 10000
+    context_length: int = 512
+    d_model: int = 2560
+    d_ff: int = 10240
+    num_layers: int = 32
+    num_heads: int = 32
+    rope_theta: float = 10000.0
+
+
+@dataclass
+class BenchmarkConfig:
+    warmup_iters: int = 5
+    run_iters: int = 10
+    verbose: bool = True
+    batch_size: int = 4
+    device: str = "cuda"
+    mode: str = "forward_only"
+    precision: str = "fp32"
+    compile: bool = False
+    compile_mode: str = "default"
+    profile: bool = False
+
+
+@dataclass
+class Config:
+    experiment_name: str = "benchmark"
+    model: ModelConfig = field(default_factory=ModelConfig)
+    benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
+
+
+cs = ConfigStore.instance()
+cs.store(name="config_schema", node=Config)
 
 
 def get_git_info() -> dict[str, str]:
@@ -90,7 +130,7 @@ def sync_device(device: str):
         torch.cuda.synchronize()
 
 
-def generate_random_data(cfg: DictConfig) -> tuple[torch.Tensor, torch.Tensor]:
+def generate_random_data(cfg: Config) -> tuple[torch.Tensor, torch.Tensor]:
     """Generates a random dataset of token IDs."""
     dataset_size = 100000
     dataset = np.random.randint(
@@ -112,7 +152,7 @@ def generate_random_data(cfg: DictConfig) -> tuple[torch.Tensor, torch.Tensor]:
     return x, y
 
 
-def init_model(cfg: DictConfig) -> BasicsTransformerLM:
+def init_model(cfg: Config) -> BasicsTransformerLM:
     """Initialize the transformer model."""
     model = BasicsTransformerLM(
         vocab_size=cfg.model.vocab_size,
@@ -123,99 +163,32 @@ def init_model(cfg: DictConfig) -> BasicsTransformerLM:
         d_ff=cfg.model.d_ff,
         rope_theta=cfg.model.rope_theta,
     )
-    model = model.to(cfg.benchmark.device)
+
+    # Handle precision
+    dtype = torch.float32
+    precision = cfg.benchmark.precision
+    if precision == "bf16":
+        dtype = torch.bfloat16
+    elif precision == "fp16":
+        dtype = torch.float16
+
+    model = model.to(cfg.benchmark.device, dtype=dtype)
+
+    if cfg.benchmark.compile:
+        compile_mode = cfg.benchmark.compile_mode
+        log.info(f"Compiling model with torch.compile(mode='{compile_mode}')...")
+        model = torch.compile(model, mode=compile_mode)
 
     if cfg.benchmark.verbose:
         log.info(
-            f"Model initialized with {model.get_num_params() / 1e6:.2f}M parameters"
+            f"Model initialized with {model.get_num_params() / 1e6:.2f}M parameters (precision: {precision})"
         )
 
     return model
 
 
-def benchmark_forward(
-    model: BasicsTransformerLM,
-    x: torch.Tensor,
-    cfg: DictConfig,
-) -> float:
-    """Benchmark forward pass only."""
-    device = cfg.benchmark.device
-
-    # Warmup
-    if cfg.benchmark.verbose:
-        log.info(f"[Forward] Running {cfg.benchmark.warmup_iters} warmup iterations...")
-    for _ in range(cfg.benchmark.warmup_iters):
-        with torch.no_grad():
-            _ = model(x)
-    sync_device(device)
-
-    # Benchmark
-    if cfg.benchmark.verbose:
-        log.info(f"[Forward] Running {cfg.benchmark.run_iters} benchmark iterations...")
-
-    sync_device(device)
-    start = time.perf_counter()
-    for _ in range(cfg.benchmark.run_iters):
-        with torch.no_grad():
-            _ = model(x)
-    sync_device(device)
-    end = time.perf_counter()
-
-    avg_time_ms = (end - start) / cfg.benchmark.run_iters * 1000
-    return avg_time_ms
-
-
-def benchmark_forward_backward(
-    model: BasicsTransformerLM,
-    x: torch.Tensor,
-    y: torch.Tensor,
-    cfg: DictConfig,
-) -> float:
-    """Benchmark forward + backward pass."""
-    device = cfg.benchmark.device
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    criterion = torch.nn.CrossEntropyLoss()
-
-    # Warmup
-    if cfg.benchmark.verbose:
-        log.info(
-            f"[Forward+Backward] Running {cfg.benchmark.warmup_iters} warmup iterations..."
-        )
-    for _ in range(cfg.benchmark.warmup_iters):
-        outputs = model(x)
-        loss = criterion(outputs.view(-1, cfg.model.vocab_size), y.view(-1))
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-    sync_device(device)
-
-    # Benchmark
-    if cfg.benchmark.verbose:
-        log.info(
-            f"[Forward+Backward] Running {cfg.benchmark.run_iters} benchmark iterations..."
-        )
-
-    sync_device(device)
-    start = time.perf_counter()
-    for _ in range(cfg.benchmark.run_iters):
-        outputs = model(x)
-        loss = criterion(outputs.view(-1, cfg.model.vocab_size), y.view(-1))
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-    sync_device(device)
-    end = time.perf_counter()
-
-    avg_time_ms = (end - start) / cfg.benchmark.run_iters * 1000
-    return avg_time_ms
-
-
-@hydra.main(version_base=None, config_path="../configs", config_name="config")
-def main(cfg: DictConfig):
-    # 1. Initialize WandB
-    git_info = get_git_info()
-    system_info = get_system_info()
-
+def init_wandb(cfg: Config, git_info: dict[str, str], system_info: dict[str, Any]):
+    """Initialize Weights & Biases logging."""
     # Convert OmegaConf to dict for wandb
     config_dict = OmegaConf.to_container(cfg, resolve=True)
     config_dict["git"] = git_info
@@ -225,51 +198,20 @@ def main(cfg: DictConfig):
     reproduce_command = " ".join(sys.argv)
     config_dict["reproduce_command"] = reproduce_command
 
-    run = wandb.init(
+    wandb.init(
         project="cs336-systems-benchmark",
         name=cfg.experiment_name,
         config=config_dict,
         tags=[cfg.benchmark.mode, git_info["hash_short"]],
     )
 
-    log.info(f"Starting benchmark: {cfg.experiment_name}")
-    log.info(f"Git: {git_info['hash_short']} ({git_info['branch']})")
-    log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
 
-    if cfg.benchmark.device != "cuda" and torch.cuda.is_available():
-        log.warning("CUDA is available but device is set to CPU!")
-
-    # 2. Initialize Model & Data
-    model = init_model(cfg)
-    model_params = model.get_num_params()
-    log.info(f"Model parameters: {model_params / 1e6:.2f}M")
-
-    x, y = generate_random_data(cfg)
-
-    # 3. Run Benchmark
-    if cfg.benchmark.mode == "forward_only":
-        avg_time_ms = benchmark_forward(model, x, cfg)
-    elif cfg.benchmark.mode == "forward_backward":
-        avg_time_ms = benchmark_forward_backward(model, x, y, cfg)
-    else:
-        raise ValueError(f"Unknown benchmark mode: {cfg.benchmark.mode}")
-
-    # 4. Log Results
-    throughput = cfg.benchmark.batch_size / (avg_time_ms / 1000)
-
-    results = {
-        "avg_time_ms": avg_time_ms,
-        "throughput_samples_per_sec": throughput,
-        "model_params_millions": model_params / 1e6,
-    }
-
-    wandb.log(results)
-
-    # Save to central CSV
+def log_to_csv(cfg: Config, results: dict[str, float], git_info: dict[str, str]):
+    """Log results to a central CSV file."""
     import csv
 
     original_cwd = hydra.utils.get_original_cwd()
-    central_csv_path = Path(original_cwd) / "benchmark_results.csv"
+    central_csv_path = Path(original_cwd) / "benchmark_res.csv"
 
     file_exists = central_csv_path.exists()
 
@@ -293,6 +235,9 @@ def main(cfg: DictConfig):
         "d_ff": cfg.model.d_ff,
         "batch_size": cfg.benchmark.batch_size,
         "mode": cfg.benchmark.mode,
+        "precision": cfg.benchmark.precision,
+        "compile": cfg.benchmark.compile,
+        "compile_mode": cfg.benchmark.compile_mode,
         **results,
     }
 
@@ -302,10 +247,203 @@ def main(cfg: DictConfig):
             writer.writeheader()
         writer.writerow(flat_results)
 
-    log.info(f"Benchmark finished. Results: {results}")
     log.info(f"Results appended to {central_csv_path}")
 
-    wandb.finish()
+
+def benchmark_forward(
+    model: BasicsTransformerLM,
+    x: torch.Tensor,
+    cfg: Config,
+) -> tuple[float, float]:
+    """Benchmark forward pass only. Returns (avg_time_ms, peak_memory_gb)."""
+    device = cfg.benchmark.device
+
+    # Warmup
+    if cfg.benchmark.verbose:
+        log.info(f"[Forward] Running {cfg.benchmark.warmup_iters} warmup iterations...")
+    for _ in range(cfg.benchmark.warmup_iters):
+        with torch.no_grad():
+            _ = model(x)
+    sync_device(device)
+
+    # Reset memory stats
+    if "cuda" in device:
+        torch.cuda.reset_peak_memory_stats()
+
+    # Benchmark
+    if cfg.benchmark.verbose:
+        log.info(f"[Forward] Running {cfg.benchmark.run_iters} benchmark iterations...")
+
+    sync_device(device)
+    if "cuda" in device and cfg.benchmark.profile:
+        torch.cuda.profiler.start()
+    start = time.perf_counter()
+    for _ in range(cfg.benchmark.run_iters):
+        with torch.no_grad():
+            _ = model(x)
+    sync_device(device)
+    end = time.perf_counter()
+    if "cuda" in device and cfg.benchmark.profile:
+        torch.cuda.profiler.stop()
+
+    peak_memory_gb = 0.0
+    if "cuda" in device:
+        peak_memory_gb = torch.cuda.max_memory_allocated() / (1024**3)
+
+    avg_time_ms = (end - start) / cfg.benchmark.run_iters * 1000
+    return avg_time_ms, peak_memory_gb
+
+
+def benchmark_forward_backward(
+    model: BasicsTransformerLM,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    cfg: Config,
+) -> tuple[float, float]:
+    """Benchmark forward + backward pass. Returns (avg_time_ms, peak_memory_gb)."""
+    device = cfg.benchmark.device
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    criterion = torch.nn.CrossEntropyLoss()
+
+    # Warmup
+    if cfg.benchmark.verbose:
+        log.info(
+            f"[Forward+Backward] Running {cfg.benchmark.warmup_iters} warmup iterations..."
+        )
+    for _ in range(cfg.benchmark.warmup_iters):
+        outputs = model(x)
+        loss = criterion(outputs.view(-1, cfg.model.vocab_size), y.view(-1))
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+    sync_device(device)
+
+    # Reset memory stats
+    if "cuda" in device:
+        torch.cuda.reset_peak_memory_stats()
+
+    # Benchmark
+    if cfg.benchmark.verbose:
+        log.info(
+            f"[Forward+Backward] Running {cfg.benchmark.run_iters} benchmark iterations..."
+        )
+
+    sync_device(device)
+    if "cuda" in device and cfg.benchmark.profile:
+        torch.cuda.profiler.start()
+    start = time.perf_counter()
+    for _ in range(cfg.benchmark.run_iters):
+        outputs = model(x)
+        loss = criterion(outputs.view(-1, cfg.model.vocab_size), y.view(-1))
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+    sync_device(device)
+    end = time.perf_counter()
+    if "cuda" in device and cfg.benchmark.profile:
+        torch.cuda.profiler.stop()
+
+    peak_memory_gb = 0.0
+    if "cuda" in device:
+        peak_memory_gb = torch.cuda.max_memory_allocated() / (1024**3)
+
+    avg_time_ms = (end - start) / cfg.benchmark.run_iters * 1000
+    return avg_time_ms, peak_memory_gb
+
+
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
+def main(cfg: Config):
+    # 1. Initialize WandB
+    git_info = get_git_info()
+    system_info = get_system_info()
+    init_wandb(cfg, git_info, system_info)
+
+    log.info(f"Starting benchmark: {cfg.experiment_name}")
+    log.info(f"Git: {git_info['hash_short']} ({git_info['branch']})")
+    log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
+
+    if cfg.benchmark.device != "cuda" and torch.cuda.is_available():
+        log.warning("CUDA is available but device is set to CPU!")
+
+    try:
+        # 2. Initialize Model & Data
+        model = init_model(cfg)
+        model_params = model.get_num_params()
+        log.info(f"Model parameters: {model_params / 1e6:.2f}M")
+
+        x, y = generate_random_data(cfg)
+
+        # 3. Run Benchmark
+        if cfg.benchmark.mode == "forward_only":
+            avg_time_ms, peak_memory_gb = benchmark_forward(model, x, cfg)
+        elif cfg.benchmark.mode == "forward_backward":
+            avg_time_ms, peak_memory_gb = benchmark_forward_backward(model, x, y, cfg)
+        else:
+            raise ValueError(f"Unknown benchmark mode: {cfg.benchmark.mode}")
+
+        # 4. Log Results
+        throughput = cfg.benchmark.batch_size / (avg_time_ms / 1000)
+
+        results = {
+            "avg_time_ms": avg_time_ms,
+            "throughput_samples_per_sec": throughput,
+            "model_params_millions": model_params / 1e6,
+            "peak_memory_gb": peak_memory_gb,
+            "status": "success",
+            # Log key config parameters as metrics for easier visualization in WandB
+            "context_length": cfg.model.context_length,
+            "batch_size": cfg.benchmark.batch_size,
+            "vocab_size": cfg.model.vocab_size,
+            "d_model": cfg.model.d_model,
+            "num_layers": cfg.model.num_layers,
+            "compile": cfg.benchmark.compile,
+            "compile_mode": cfg.benchmark.compile_mode,
+        }
+
+        wandb.log(results)
+        log.info(f"Benchmark finished. Results: {results}")
+
+        # Save to central CSV
+        log_to_csv(cfg, results, git_info)
+
+    except torch.cuda.OutOfMemoryError:
+        log.error("OOM: Out of Memory Error!")
+        wandb.log({"status": "oom"})
+
+        # Log OOM to CSV
+        results = {
+            "avg_time_ms": float("nan"),
+            "throughput_samples_per_sec": float("nan"),
+            "model_params_millions": float("nan"),
+            "peak_memory_gb": float("nan"),
+            "status": "oom",
+        }
+        # Try to get model params if model was initialized
+        if "model" in locals():
+            results["model_params_millions"] = model.get_num_params() / 1e6
+
+        log_to_csv(cfg, results, git_info)
+
+    except Exception as e:
+        log.error(f"An error occurred: {e}")
+        wandb.log({"status": "failed", "error": str(e)})
+        raise e
+
+    finally:
+        wandb.finish()
+
+        # Cleanup memory
+        if "model" in locals():
+            del model
+        if "x" in locals():
+            del x
+        if "y" in locals():
+            del y
+        if "optimizer" in locals():
+            del optimizer
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
