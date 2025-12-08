@@ -21,10 +21,6 @@ def get_batch(
             for i in starting_idxs
         ]
     )  # fmt: skip
-    if "cuda" in device:
-        x = x.pin_memory().to(device, non_blocking=True)
-        y = y.pin_memory().to(device, non_blocking=True)
-    else:
-        x = x.to(device)
-        y = y.to(device)
+    x = x.pin_memory().to(device, non_blocking=True)
+    y = y.pin_memory().to(device, non_blocking=True)
     return x, y

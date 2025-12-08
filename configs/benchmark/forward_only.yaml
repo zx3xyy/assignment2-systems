@@ -8,3 +8,5 @@ precision: fp32
 compile: false
 compile_mode: default
 profile: false
+autocast: false
+memory_snapshot: false

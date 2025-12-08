@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from contextlib import nullcontext
 import hydra
 import numpy as np
 import torch
@@ -50,6 +51,8 @@ class BenchmarkConfig:
     compile: bool = False
     compile_mode: str = "default"
     profile: bool = False
+    autocast: bool = False
+    memory_snapshot: bool = False
 
 
 @dataclass
@@ -142,19 +145,16 @@ def get_system_info() -> dict[str, Any]:
     return {
         "python_version": sys.version,
         "torch_version": torch.__version__,
-        "cuda_available": torch.cuda.is_available(),
-        "cuda_version": torch.version.cuda if torch.cuda.is_available() else None,
-        "gpu_name": (
-            torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-        ),
-        "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        "cuda_available": True,
+        "cuda_version": torch.version.cuda,
+        "gpu_name": torch.cuda.get_device_name(0),
+        "gpu_count": torch.cuda.device_count(),
     }
 
 
 def sync_device(device: str):
-    """Synchronize CUDA device if applicable."""
-    if "cuda" in device:
-        torch.cuda.synchronize()
+    """Synchronize CUDA device."""
+    torch.cuda.synchronize()
 
 
 def generate_random_data(cfg: Config) -> tuple[torch.Tensor, torch.Tensor]:
@@ -238,7 +238,9 @@ def log_to_csv(cfg: Config, results: dict[str, float], git_info: dict[str, str])
     import csv
 
     original_cwd = hydra.utils.get_original_cwd()
-    central_csv_path = Path(original_cwd) / "benchmark_res.csv"
+    # Use a different CSV file for autocast experiments as requested
+    csv_filename = "benchmark_autocast_results.csv"
+    central_csv_path = Path(original_cwd) / csv_filename
 
     file_exists = central_csv_path.exists()
 
@@ -265,6 +267,7 @@ def log_to_csv(cfg: Config, results: dict[str, float], git_info: dict[str, str])
         "precision": cfg.benchmark.precision,
         "compile": cfg.benchmark.compile,
         "compile_mode": cfg.benchmark.compile_mode,
+        "autocast": cfg.benchmark.autocast,
         **results,
     }
 
@@ -288,39 +291,47 @@ def benchmark_forward(
     # Warmup
     if cfg.benchmark.verbose:
         log.info(f"[Forward] Running {cfg.benchmark.warmup_iters} warmup iterations...")
-    
+
+    ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if cfg.benchmark.autocast
+        else nullcontext()
+    )
+
     with torch.cuda.nvtx.range("warmup"):
         for _ in range(cfg.benchmark.warmup_iters):
             with torch.no_grad():
-                _ = model(x)
+                with ctx:
+                    _ = model(x)
     sync_device(device)
 
     # Reset memory stats
-    if "cuda" in device:
-        torch.cuda.reset_peak_memory_stats()
+    torch.cuda.reset_peak_memory_stats()
 
     # Benchmark
     if cfg.benchmark.verbose:
         log.info(f"[Forward] Running {cfg.benchmark.run_iters} benchmark iterations...")
 
     sync_device(device)
-    if "cuda" in device and cfg.benchmark.profile:
-        torch.cuda.profiler.start()
-    
+
+    if cfg.benchmark.memory_snapshot:
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
     with torch.cuda.nvtx.range("benchmark_loop"):
         start = time.perf_counter()
         for _ in range(cfg.benchmark.run_iters):
             with torch.no_grad():
-                _ = model(x)
+                with ctx:
+                    _ = model(x)
         sync_device(device)
         end = time.perf_counter()
-    
-    if "cuda" in device and cfg.benchmark.profile:
-        torch.cuda.profiler.stop()
 
-    peak_memory_gb = 0.0
-    if "cuda" in device:
-        peak_memory_gb = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_memory_gb = torch.cuda.max_memory_allocated() / (1024**3)
+    if cfg.benchmark.memory_snapshot:
+        torch.cuda.memory._dump_snapshot(
+            f"{cfg.model.context_length}_forward_memory_snapshot.pickle"
+        )
+        torch.cuda.memory._record_memory_history(enabled=None)
+        torch.cuda.reset_peak_memory_stats()
 
     avg_time_ms = (end - start) / cfg.benchmark.run_iters * 1000
     return avg_time_ms, peak_memory_gb
@@ -342,19 +353,22 @@ def benchmark_forward_backward(
         log.info(
             f"[Forward+Backward] Running {cfg.benchmark.warmup_iters} warmup iterations..."
         )
-    
+
+    ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if cfg.benchmark.autocast
+        else nullcontext()
+    )
+
     with torch.cuda.nvtx.range("warmup"):
         for _ in range(cfg.benchmark.warmup_iters):
-            outputs = model(x)
-            loss = criterion(outputs.view(-1, cfg.model.vocab_size), y.view(-1))
+            with ctx:
+                outputs = model(x)
+                loss = criterion(outputs.view(-1, cfg.model.vocab_size), y.view(-1))
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
     sync_device(device)
-
-    # Reset memory stats
-    if "cuda" in device:
-        torch.cuda.reset_peak_memory_stats()
 
     # Benchmark
     if cfg.benchmark.verbose:
@@ -363,26 +377,34 @@ def benchmark_forward_backward(
         )
 
     sync_device(device)
-    if "cuda" in device and cfg.benchmark.profile:
-        torch.cuda.profiler.start()
-    
+
+    if cfg.benchmark.memory_snapshot:
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+
     with torch.cuda.nvtx.range("benchmark_loop"):
         start = time.perf_counter()
         for _ in range(cfg.benchmark.run_iters):
-            outputs = model(x)
-            loss = criterion(outputs.view(-1, cfg.model.vocab_size), y.view(-1))
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+            with torch.cuda.nvtx.range("forward"):
+                with ctx:
+                    outputs = model(x)
+            with torch.cuda.nvtx.range("backward"):
+                with ctx:
+                    loss = criterion(outputs.view(-1, cfg.model.vocab_size), y.view(-1))
+                loss.backward()
+            with torch.cuda.nvtx.range("optimizer_step"):
+                optimizer.step()
+                optimizer.zero_grad()
         sync_device(device)
         end = time.perf_counter()
-    
-    if "cuda" in device and cfg.benchmark.profile:
-        torch.cuda.profiler.stop()
 
-    peak_memory_gb = 0.0
-    if "cuda" in device:
-        peak_memory_gb = torch.cuda.max_memory_allocated() / (1024**3)
+    if cfg.benchmark.memory_snapshot:
+        torch.cuda.memory._dump_snapshot(
+            f"{cfg.model.context_length}_forward_backward_memory_snapshot.pickle"
+        )
+        torch.cuda.memory._record_memory_history(enabled=None)
+        torch.cuda.reset_peak_memory_stats()
+
+    peak_memory_gb = torch.cuda.max_memory_allocated() / (1024**3)
 
     avg_time_ms = (end - start) / cfg.benchmark.run_iters * 1000
     return avg_time_ms, peak_memory_gb
@@ -398,12 +420,6 @@ def main(cfg: Config):
     log.info(f"Starting benchmark: {cfg.experiment_name}")
     log.info(f"Git: {git_info['hash_short']} ({git_info['branch']})")
     log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
-
-    if cfg.benchmark.device != "cuda":
-        raise ValueError("Device must be set to 'cuda' for this benchmark.")
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available on this system.")
 
     try:
         # 2. Initialize Model & Data
